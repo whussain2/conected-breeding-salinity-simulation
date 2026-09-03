@@ -1,6 +1,6 @@
 ################################################################################
 ## 05_analyse.R -- summarise the sensitivity and resource-matched runs,
-## write Supplemental Table S6 and Supplemental Figure S2, and emit the
+## write Supplemental Table S6 and Supplemental Figure, and emit the
 ## numbers quoted in the main text (out/tokens.json).
 ##
 ## Usage: Rscript R/05_analyse.R
