@@ -1,0 +1,28 @@
+# This repository holds R source code only.
+# Simulated output, figures and supplemental materials are distributed with the
+# article and are deliberately kept out of version control.
+out/
+output/
+figures/
+figures2/
+*.csv
+*.rds
+*.RData
+*.pdf
+*.tiff
+*.eps
+*.xlsx
+*.docx
+
+# R session cruft
+.Rhistory
+.Rapp.history
+.Rproj.user/
+*.Rproj
+.Renviron
+
+# OS cruft
+.DS_Store
+._*
+Thumbs.db
+desktop.ini
