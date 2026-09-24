@@ -1,11 +1,11 @@
-# This repository holds R source code only.
-# Simulated output, figures and supplemental materials are distributed with the
-# article and are deliberately kept out of version control.
-out/
+# Generated figures and supplemental materials are distributed with the article
+# and are deliberately kept out of version control.
 output/
 figures/
 figures2/
 *.csv
+!out/
+!out/*.csv
 *.rds
 *.RData
 *.pdf
