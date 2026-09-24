@@ -53,19 +53,46 @@ defaultParams <- function() {
     h2              = 0.30,    # narrow-sense heritability of training phenotypes
 
     ## Connected Breeding: donor-elite (DE) bridging
+    ##
+    ## The bridge (pre-breeding) pool is PERSISTENT and recurrently improved: it
+    ## is re-crossed to the current elite parents and re-selected every cycle, so
+    ## its mean tracks the rising elite mean, while fresh raw donors are injected
+    ## each cycle to keep supplying novel alleles.  This is what makes the
+    ## strategy cyclic.  Setting bridgeRecurrent = FALSE reverts to rebuilding
+    ## the bridge population from raw donors each cycle, in which case the bridge
+    ## pool falls progressively further behind the elite pool and the strategy
+    ## degenerates into closed-pool selection (reported as a sensitivity case).
     nBridge         = 2,       # elite-equivalent bridge lines entering per cycle
-    nBridgeCross1   = 10,      # donor x elite crosses
-    nBridgeProg1    = 40,      # progeny per donor x elite cross  (400 lines)
-    nBridgeCross2   = 10,      # (best bridge) x elite crosses
-    nBridgeProg2    = 40,      # progeny per second-step cross    (400 lines)
+    bridgeRecurrent = TRUE,    # maintain and improve a persistent bridge pool
+    bridgePoolSize  = 60,      # size of the carried-over bridge pool
+    bridgeWithinFam = TRUE,    # select the best lines WITHIN each donor family
+                               # rather than across the whole bridge pool.  Each
+                               # donor is bridged through its own pipeline, so
+                               # selection on merit does not simply retain the
+                               # least exotic lines and discard every donor
+                               # family; this is what keeps novel alleles in the
+                               # pool.
+    bridgeFamKeep   = 2,       # lines retained per donor family per cycle
+    admitDistinctFam = TRUE,   # admit at most one line per donor family, so the
+                               # lines recycled into the elite pool come from
+                               # distinct donor lineages.  Admitting simply the
+                               # highest-ranking eligible lines instead selects
+                               # the least exotic material and delivers little
+                               # novel variation per immigrant.
+    nEliteForBridge = 10,      # elite parents used in bridge crosses
+    nDonorCross     = 10,      # fresh raw donor x elite crosses per cycle
+    nDonorProg      = 20,      # progeny per fresh donor cross      (200 lines)
+    nBridgeCross2   = 10,      # (bridge pool) x elite crosses per cycle
+    nBridgeProg2    = 30,      # progeny per improvement cross      (300 lines)
     nBridgePheno    = 100,     # bridge lines phenotyped per cycle
     bridgeLag       = 0,       # cycles of delay before bridges enter elite pool
-    bridgeBar       = "parentMean",  # eligibility bar for an "elite-equivalent"
-                               # bridge line: "parentMean" = mean GEBV of the
-                               # selected elite parents (the manuscript's
-                               # elite-equivalent assumption); "poolMean" =
-                               # mean GEBV of the whole elite candidate pool;
-                               # "q75" = mean GEBV of the top quartile
+    bridgeBar       = "poolMean",    # eligibility bar for an "elite-equivalent"
+                               # bridge line: "poolMean" = the mean GEBV of the
+                               # elite candidate pool, i.e. the "elite-mean
+                               # breeding value" of the specification; "q75" =
+                               # mean GEBV of the elite top quartile;
+                               # "parentMean" = mean GEBV of the selected elite
+                               # parents (the strictest reading)
 
     ## Horizon
     cycleYears      = 3,       # years per cycle
@@ -81,13 +108,17 @@ defaultParams <- function() {
 makeFounders <- function(p, seed) {
   set.seed(seed)
 
+  ## nThreads = 1 is required for reproducibility: the coalescent simulation is
+  ## parallelised, and with more than one thread the founder haplotypes differ
+  ## between sessions even from an identical seed.
   founderPop <- runMacs2(
     nInd     = 2 * p$nFounderPerPool,
     nChr     = p$nChr,
     segSites = p$segSites,
     genLen   = p$genLen,
     split    = p$splitGen,
-    Ne       = 100
+    Ne       = 100,
+    nThreads = 1
   )
 
   SP <- SimParam$new(founderPop)
@@ -230,6 +261,7 @@ runProgram <- function(strategy, f, p, donors = NULL, seed = 1) {
   ## a common reference scale across all strategies.
   baseMeanG <- mean(as.numeric(gv(f$elite0)))
   baseVarG  <- stats::var(as.numeric(gv(f$elite0)))
+  baseGenic <- toYieldVar(as.numeric(genicVarA(f$elite0, simParam = SP)), f)
 
   ## ---- Initial training set and parents ----------------------------------
   ## MAGIC founds a single broad-base population from elite AND donor founders
@@ -239,7 +271,8 @@ runProgram <- function(strategy, f, p, donors = NULL, seed = 1) {
   trainPop <- elite
   parents  <- selectInd(elite, nInd = p$nParent, use = "pheno", simParam = SP)
 
-  donorPool <- if (strategy == "CB") donors$pop else NULL
+  donorPool  <- if (strategy == "CB") donors$pop else NULL
+  bridgePool <- NULL      # persistent donor-elite pre-breeding pool
   bridgeQueue <- list()   # bridges awaiting entry when bridgeLag > 0
 
   ## resource counters
@@ -272,12 +305,15 @@ runProgram <- function(strategy, f, p, donors = NULL, seed = 1) {
       nPheno <- nPheno + nInd(cand)
       parents <- selectInd(cand, nInd = p$nParent, use = "pheno", simParam = SP)
       gvc <- as.numeric(gv(cand))
+      genic <- toYieldVar(as.numeric(genicVarA(cand, simParam = SP)), f)
       out[[cy]] <- data.frame(
         cycle = cy, year = cy * p$cycleYears,
         meanG = toYield(mean(gvc), f),
         gain  = toYield(mean(gvc), f) - toYield(baseMeanG, f),
         varG  = toYieldVar(stats::var(gvc), f),
         varGpct = 100 * stats::var(gvc) / baseVarG,
+        varGenic = genic, varGenicPct = 100 * genic / baseGenic,
+        bridgePoolY = NA_real_, donorPoolY = NA_real_, nElig = 0L,
         nGeno = 0, nPheno = nPheno, nCross = nCrossTot, nBridgeIn = 0)
       next
     }
@@ -304,48 +340,106 @@ runProgram <- function(strategy, f, p, donors = NULL, seed = 1) {
     )
 
     ## ---- 4. Connected Breeding: donor-elite bridging --------------------
+    ## The bridge pool is a standing pre-breeding population, not a population
+    ## rebuilt from scratch each cycle.  Each cycle it receives (i) fresh raw
+    ## donor material, which is the continuing inflow of novel alleles, and
+    ## (ii) an improvement cross to the current elite parents, which keeps its
+    ## mean moving with the elite pool.  Only bridge lines that reach the
+    ## elite-equivalence bar are recycled into the elite parent set.
     newBridges <- NULL
     if (strategy == "CB") {
-      topElite <- selectInd(cand, nInd = 10, use = "ebv", simParam = SP)
+      topElite <- selectInd(cand, nInd = p$nEliteForBridge, use = "ebv",
+                            simParam = SP)
 
-      ## step 1: donor x elite
-      b1 <- randCross2(females = donorPool, males = topElite,
-                       nCrosses = p$nBridgeCross1, nProgeny = p$nBridgeProg1,
-                       simParam = SP)
-      nCrossTot <- nCrossTot + p$nBridgeCross1
-      nGeno     <- nGeno + nInd(b1)
-      b1  <- setEBV(b1, mod, simParam = SP)
-      b1t <- selectInd(b1, nInd = min(20, nInd(b1)), use = "ebv", simParam = SP)
+      ## (i) fresh raw donors x current elite
+      inj <- randCross2(females = donorPool, males = topElite,
+                        nCrosses = p$nDonorCross, nProgeny = p$nDonorProg,
+                        simParam = SP)
+      nCrossTot <- nCrossTot + p$nDonorCross
+      nGeno     <- nGeno + nInd(inj)
 
-      ## step 2: (best bridge) x elite -- raises the bridge mean toward elite
-      b2 <- randCross2(females = b1t, males = topElite,
-                       nCrosses = p$nBridgeCross2, nProgeny = p$nBridgeProg2,
-                       simParam = SP)
-      nCrossTot <- nCrossTot + p$nBridgeCross2
-      nGeno     <- nGeno + nInd(b2)
+      ## (ii) recurrent improvement of the standing bridge pool
+      if (p$bridgeRecurrent && !is.null(bridgePool) && nInd(bridgePool) >= 2) {
+        imp <- randCross2(females = bridgePool, males = topElite,
+                          nCrosses = p$nBridgeCross2, nProgeny = p$nBridgeProg2,
+                          simParam = SP)
+        nCrossTot <- nCrossTot + p$nBridgeCross2
+        nGeno     <- nGeno + nInd(imp)
+        bridgeCand <- c(inj, imp)
+      } else if (!p$bridgeRecurrent) {
+        ## non-recurrent control: a second cross of the freshly made donor
+        ## material only, discarded again at the end of the cycle
+        top1 <- selectInd(inj, nInd = min(20, nInd(inj)),
+                          use = "gv", simParam = SP)
+        imp  <- randCross2(females = top1, males = topElite,
+                           nCrosses = p$nBridgeCross2,
+                           nProgeny = p$nBridgeProg2, simParam = SP)
+        nCrossTot <- nCrossTot + p$nBridgeCross2
+        nGeno     <- nGeno + nInd(imp)
+        bridgeCand <- imp
+      } else {
+        bridgeCand <- inj
+      }
 
-      ## bridge lines are phenotyped too (a real cost of the strategy)
+      ## the bridge pool is evaluated in its own right: a sample is phenotyped
+      ## and added to the training set, so that predictions for donor-derived
+      ## material are informed by data on donor-derived material rather than by
+      ## an exclusively elite training population
       if (p$nBridgePheno > 0) {
-        bIdx <- sample.int(nInd(b2), min(p$nBridgePheno, nInd(b2)))
-        bPh  <- setPheno(b2[bIdx], h2 = p$h2, p = pEnv, simParam = SP)
+        bIdx <- sample.int(nInd(bridgeCand),
+                           min(p$nBridgePheno, nInd(bridgeCand)))
+        bPh  <- setPheno(bridgeCand[bIdx], h2 = p$h2, p = pEnv, simParam = SP)
         nPheno   <- nPheno + nInd(bPh)
         trainPop <- c(trainPop, bPh)
         if (nInd(trainPop) > p$trainCap) {
           keep <- (nInd(trainPop) - p$trainCap + 1):nInd(trainPop)
           trainPop <- trainPop[keep]
         }
+        ## refit with the bridge phenotypes included before judging the bridges
+        mod  <- RRBLUP(trainPop, use = "pheno", simParam = SP)
+        cand <- setEBV(cand, mod, simParam = SP)
+        eliteEbv <- as.numeric(ebv(cand))
+        eliteBar <- switch(p$bridgeBar,
+          poolMean   = mean(eliteEbv),
+          q75        = mean(eliteEbv[eliteEbv >= stats::quantile(eliteEbv, 0.75)]),
+          parentMean = mean(sort(eliteEbv, decreasing = TRUE)[seq_len(p$nParent)])
+        )
       }
 
-      b2 <- setEBV(b2, mod, simParam = SP)
-      ## "elite-equivalent" pre-selection: only bridges reaching the mean
-      ## genomic breeding value of the elite candidate pool are eligible
-      elig <- b2[as.numeric(ebv(b2)) >= eliteBar]
+      bridgeCand <- setEBV(bridgeCand, mod, simParam = SP)
+
+      ## carry the best of the bridge candidates forward as next cycle's pool.
+      ## Selecting WITHIN family keeps every donor lineage represented; a pool
+      ## selected across families converges on the least exotic material and
+      ## the inflow of novel alleles is lost.
+      bridgePool <- if (p$bridgeWithinFam) {
+        bp <- selectWithinFam(bridgeCand, nInd = p$bridgeFamKeep, use = "ebv",
+                              simParam = SP)
+        if (nInd(bp) > p$bridgePoolSize)
+          bp[sample.int(nInd(bp), p$bridgePoolSize)] else bp
+      } else {
+        selectInd(bridgeCand, nInd = min(p$bridgePoolSize, nInd(bridgeCand)),
+                  use = "ebv", simParam = SP)
+      }
+
+      ## "elite-equivalent" pre-selection: only bridge lines reaching the mean
+      ## genomic breeding value of the elite pool are eligible to be recycled.
+      elig <- bridgeCand[as.numeric(ebv(bridgeCand)) >= eliteBar]
       if (nInd(elig) > 0) {
-        newBridges <- selectInd(elig, nInd = min(p$nBridge, nInd(elig)),
-                                use = "ebv", simParam = SP)
+        if (p$admitDistinctFam) {
+          ## best eligible line per family, then the best nBridge families:
+          ## the immigrants come from different donor lineages
+          best <- selectWithinFam(elig, nInd = 1, use = "ebv", simParam = SP)
+          newBridges <- selectInd(best, nInd = min(p$nBridge, nInd(best)),
+                                  use = "ebv", simParam = SP)
+        } else {
+          newBridges <- selectInd(elig, nInd = min(p$nBridge, nInd(elig)),
+                                  use = "ebv", simParam = SP)
+        }
       }
 
-      ## maintain the donor reservoir (random mating, no selection)
+      ## maintain the donor reservoir (random mating, no selection: gene-bank
+      ## donors are not themselves under yield selection)
       donorPool <- randCross(donorPool, nCrosses = nInd(donorPool),
                              nProgeny = 1, simParam = SP)
     }
@@ -366,7 +460,14 @@ runProgram <- function(strategy, f, p, donors = NULL, seed = 1) {
     }
 
     ## ---- 6. record ------------------------------------------------------
+    ## Two variance metrics are recorded.  varG is the total genetic variance of
+    ## the candidate population, which is inflated by any between-family
+    ## structure that admixture creates.  varGenic is the genic variance
+    ## (sum over QTL of 2pq a^2): it measures allelic diversity alone, is
+    ## unaffected by linkage disequilibrium or family structure, and is the
+    ## quantity that determines the capacity to keep responding to selection.
     gvc <- as.numeric(gv(cand))
+    genic <- toYieldVar(as.numeric(genicVarA(cand, simParam = SP)), f)
     out[[cy]] <- data.frame(
       cycle   = cy,
       year    = cy * p$cycleYears,
@@ -374,6 +475,14 @@ runProgram <- function(strategy, f, p, donors = NULL, seed = 1) {
       gain    = toYield(mean(gvc), f) - toYield(baseMeanG, f),
       varG    = toYieldVar(stats::var(gvc), f),
       varGpct = 100 * stats::var(gvc) / baseVarG,
+      varGenic    = genic,
+      varGenicPct = 100 * genic / baseGenic,
+      bridgePoolY = if (is.null(bridgePool)) NA_real_ else
+                      toYield(mean(as.numeric(gv(bridgePool))), f),
+      donorPoolY  = if (is.null(donorPool)) NA_real_ else
+                      toYield(mean(as.numeric(gv(donorPool))), f),
+      nElig       = if (strategy == "CB")
+                      sum(as.numeric(ebv(bridgeCand)) >= eliteBar) else 0L,
       nGeno   = nGeno,
       nPheno  = nPheno,
       nCross  = nCrossTot,

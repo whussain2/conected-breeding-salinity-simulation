@@ -1,110 +1,150 @@
 ################################################################################
-## 05_analyse.R -- summarise the sensitivity and resource-matched runs,
-## write Supplemental Table S6 and Supplemental Figure, and emit the
-## numbers quoted in the main text (out/tokens.json).
+## 05_analyse.R -- paired contrasts, Supplemental Table S6, and the numbers
+## quoted in the main text (out/tokens.json).
+##
+## Reported quantities, per scenario, all paired within replicate:
+##   * cumulative gain at year 30 and year 60
+##   * the LATE-HORIZON RATE of gain (regression slope over years 45-60):
+##     this is the quantity that distinguishes a saturating from a
+##     non-saturating response, and it is the primary outcome here
+##   * genic variance retained (sum 2pq a^2, % of the elite base): allelic
+##     diversity, unaffected by the between-family structure that admixture
+##     creates in the total genetic variance
+##   * realised resource use
 ##
 ## Usage: Rscript R/05_analyse.R
 ################################################################################
 
+## ------------------------------------------------------------------ paths --
+## Locate the bundle this script belongs to, so it works whether it is run with
+## Rscript, sourced, or run from the RStudio editor, and whatever the working
+## directory happens to be.  The script's OWN folder is tried first, so if two
+## copies of the bundle exist (for example a newer one unzipped inside an older
+## one) each copy uses its own data.  Set CB_SIM_ROOT to override.
+.cb_script_dir <- function() {
+  ca <- commandArgs(trailingOnly = FALSE)
+  f  <- grep("^--file=", ca, value = TRUE)
+  if (length(f)) return(dirname(sub("^--file=", "", f[1])))
+  for (i in rev(seq_len(sys.nframe()))) {
+    of <- tryCatch(get0("ofile", envir = sys.frame(i), inherits = FALSE),
+                   error = function(e) NULL)
+    if (is.character(of) && length(of) == 1L) return(dirname(of))
+  }
+  if (requireNamespace("rstudioapi", quietly = TRUE) &&
+      isTRUE(tryCatch(rstudioapi::isAvailable(), error = function(e) FALSE))) {
+    p <- tryCatch(rstudioapi::getSourceEditorContext()$path,
+                  error = function(e) "")
+    if (is.character(p) && nzchar(p)) return(dirname(p))
+  }
+  NA_character_
+}
+
+.cb_is_root <- function(p) file.exists(file.path(p, "R", "01_functions.R"))
+
+.cb_candidates <- function() {
+  cand <- character(0)
+  env <- Sys.getenv("CB_SIM_ROOT")
+  if (nzchar(env)) cand <- c(cand, env)
+  sd <- .cb_script_dir()
+  if (!is.na(sd)) cand <- c(cand, file.path(sd, ".."), sd)
+  cand <- c(cand, getwd(), file.path(getwd(), ".."),
+            file.path(getwd(), "..", ".."))
+  cand <- unique(normalizePath(cand, mustWork = FALSE))
+  cand[vapply(cand, .cb_is_root, logical(1))]
+}
+
+.cb_roots <- .cb_candidates()
+if (!length(.cb_roots)) {
+  stop("Could not locate the simulation bundle.\n",
+       "  Expected a folder containing R/01_functions.R at or above: ", getwd(),
+       "\n  Run this script from the bundle folder, e.g.\n",
+       "      setwd('/path/to/connected-breeding-salinity-simulation')\n",
+       "      source('R/08_figures.R')\n",
+       "  or set it explicitly:\n",
+       "      Sys.setenv(CB_SIM_ROOT = '/path/to/connected-breeding-salinity-simulation')",
+       call. = FALSE)
+}
+ROOT   <- .cb_roots[1]
+OUTDIR <- file.path(ROOT, "out")
+FIGDIR <- file.path(ROOT, "figures")
+RDIR   <- file.path(ROOT, "R")
+message("bundle root: ", ROOT)
+## ---------------------------------------------------------------------------
+
+## Guard against being pointed at the superseded first-round output, whose
+## files predate the corrected bridging model and lack the genic-variance
+## column.  Failing loudly here is much safer than silently producing figures
+## from the wrong run.
+.cb_check_output <- function(outdir) {
+  f <- Sys.glob(file.path(outdir, "raw_*.csv"))
+  f <- f[!grepl("strategies", f)]
+  if (!length(f))
+    stop("No simulation output in ", outdir, "\n",
+         "  Expected files such as raw_coreA.csv. Run R/03_run.R first, or point\n",
+         "  CB_SIM_ROOT at the bundle whose out/ folder contains them.",
+         call. = FALSE)
+  hdr <- names(utils::read.csv(f[1], nrows = 1))
+  missing <- setdiff(c("scenario", "seed", "year", "gain", "varGenicPct"), hdr)
+  if (length(missing))
+    stop("The output in ", outdir, " is from the superseded first-round run.\n",
+         "  Missing column(s): ", paste(missing, collapse = ", "), "\n",
+         "  Those files predate the corrected bridging model and cannot be used\n",
+         "  with this version of the scripts. Use the out/ folder that shipped\n",
+         "  with this copy of the code, or re-run R/03_run.R.", call. = FALSE)
+  invisible(TRUE)
+}
+.cb_check_output(OUTDIR)
+
 options(stringsAsFactors = FALSE)
 
-files <- Sys.glob("out/raw_*.csv")
-files <- files[!grepl("smoke|strategies", files)]
+files <- Sys.glob(file.path(OUTDIR, "raw_*.csv"))
+files <- files[!grepl("strategies", files)]
 d <- do.call(rbind, lapply(files, function(fn) {
-  x <- read.csv(fn)
-  x$src <- fn
-  x
+  x <- read.csv(fn); x$src <- basename(fn); x
 }))
-## unique replicate identifier across workers
-d$repid <- paste(d$src, d$rep, sep = "_")
+## Replicates are keyed by SEED, not by output file: the same seed means the same
+## founder genomes, so scenarios run in different batches still pair correctly.
+d$repid    <- paste0("seed", d$seed)
 d$strategy <- as.character(d$strategy)
 
-message("rows: ", nrow(d), " | replicates: ", length(unique(d$repid)),
-        " | scenarios: ", length(unique(d$scenario)))
+message("rows ", nrow(d), " | replicates ", length(unique(d$repid)),
+        " | scenarios ", length(unique(d$scenario)))
 
-## ---------------------------------------------------------------- helpers
-## final-year record for each scenario x replicate
-finalOf <- function(df) {
-  do.call(rbind, lapply(split(df, list(df$scenario, df$repid), drop = TRUE),
-                        function(g) g[which.max(g$year), ]))
-}
-fin <- finalOf(d)  # retained for reference
-
-## year-30 record (mid-horizon)
-at <- function(df, yr) {
-  do.call(rbind, lapply(split(df, list(df$scenario, df$repid), drop = TRUE),
-                        function(g) {
-                          i <- which.min(abs(g$year - yr))
-                          g[i, ]
-                        }))
-}
-mid <- at(d, 30)
-
-pick <- function(df, sc) df[df$scenario == sc, ]
-
-## Lower-variance summaries of the whole trajectory, computed per scenario x
-## replicate: the mean gain over the final quarter of the horizon, and the area
-## under the gain curve (a single-number summary of the entire response).
-## The single year-60 endpoint is the noisiest possible summary; these are
-## reported alongside it.
-summaries <- function(df) {
-  do.call(rbind, lapply(split(df, list(df$scenario, df$repid), drop = TRUE),
-    function(g) {
-      g <- g[order(g$year), ]
-      lateIdx <- g$year >= max(g$year) * 0.75
-      auc <- sum(diff(c(0, g$year)) * g$gain)          # t ha-1 x yr
-      data.frame(scenario = g$scenario[1], repid = g$repid[1],
-                 strategy = g$strategy[1],
-                 axis = g$axis[1], level = g$level[1],
-                 gain60 = g$gain[nrow(g)],
-                 gainLate = mean(g$gain[lateIdx]),
-                 auc = auc,
-                 varGpct60 = g$varGpct[nrow(g)],
-                 varGpctLate = mean(g$varGpct[lateIdx]),
-                 nGeno = g$nGeno[nrow(g)], nPheno = g$nPheno[nrow(g)],
-                 donorMeanObs = g$donorMeanObs[1])
-    }))
-}
-S <- summaries(d)
-
-## paired contrast of a CB scenario against a GS-RS reference scenario.
-## All contrasts are paired within replicate (same founder genomes).
-contrast <- function(df, cbSc, gsSc = "GSRS_base") {
-  a <- df[df$scenario == cbSc, ]; b <- df[df$scenario == gsSc, ]
-  m <- merge(a, b, by = "repid", suffixes = c(".cb", ".gs"))
-  if (nrow(m) < 1) return(NULL)
-  n <- nrow(m)
-  ci <- function(x) {
-    if (n < 3) return(c(NA, NA, NA))
-    tt <- stats::t.test(x)
-    c(tt$conf.int[1], tt$conf.int[2], tt$p.value)
+## ------------------------------------------------- per scenario x replicate
+summarise1 <- function(g) {
+  g <- g[order(g$year), ]
+  yr <- max(g$year)
+  lateSlope <- {
+    x <- g[g$year >= 45, ]
+    if (nrow(x) >= 3) unname(stats::coef(stats::lm(gain ~ year, x))[2]) else NA_real_
   }
-  d60 <- m$gain60.cb   - m$gain60.gs
-  dLa <- m$gainLate.cb - m$gainLate.gs
-  dAu <- m$auc.cb      - m$auc.gs
-  dVa <- m$varGpctLate.cb - m$varGpctLate.gs
-  c60 <- ci(d60); cLa <- ci(dLa); cAu <- ci(dAu); cVa <- ci(dVa)
+  midSlope <- {
+    x <- g[g$year >= 30, ]
+    if (nrow(x) >= 3) unname(stats::coef(stats::lm(gain ~ year, x))[2]) else NA_real_
+  }
+  earlySlope <- {
+    x <- g[g$year <= 21, ]
+    if (nrow(x) >= 3) unname(stats::coef(stats::lm(gain ~ year, x))[2]) else NA_real_
+  }
+  at <- function(y) g$gain[which.min(abs(g$year - y))]
   data.frame(
-    scenario = cbSc, reference = gsSc, n = n,
-    cb_gain = mean(m$gain60.cb), gs_gain = mean(m$gain60.gs),
-    delta_gain = mean(d60), delta_sd = stats::sd(d60),
-    delta_lo = c60[1], delta_hi = c60[2], p_ttest = c60[3],
-    p_positive = mean(d60 > 0),
-    cb_late = mean(m$gainLate.cb), gs_late = mean(m$gainLate.gs),
-    delta_late = mean(dLa), delta_late_lo = cLa[1], delta_late_hi = cLa[2],
-    p_late = cLa[3],
-    delta_auc = mean(dAu), delta_auc_lo = cAu[1], delta_auc_hi = cAu[2],
-    p_auc = cAu[3],
-    cb_varpct = mean(m$varGpct60.cb), gs_varpct = mean(m$varGpct60.gs),
-    delta_var = mean(dVa), delta_var_lo = cVa[1], delta_var_hi = cVa[2],
-    p_var = cVa[3], p_var_positive = mean(dVa > 0),
-    cb_geno = mean(m$nGeno.cb), gs_geno = mean(m$nGeno.gs),
-    cb_pheno = mean(m$nPheno.cb), gs_pheno = mean(m$nPheno.gs),
-    donorMean = mean(m$donorMeanObs.cb, na.rm = TRUE)
+    scenario = g$scenario[1], repid = g$repid[1], strategy = g$strategy[1],
+    axis = g$axis[1], level = g$level[1],
+    gain30 = at(30), gain60 = g$gain[nrow(g)],
+    lateSlope = lateSlope, midSlope = midSlope, earlySlope = earlySlope,
+    ## deceleration: how much of the early rate survives to the end
+    slopeRetention = if (is.na(earlySlope) || earlySlope <= 0) NA_real_ else
+      100 * lateSlope / earlySlope,
+    genic30 = g$varGenicPct[which.min(abs(g$year - 30))],
+    genic60 = g$varGenicPct[nrow(g)],
+    varTot60 = g$varGpct[nrow(g)],
+    nGeno = g$nGeno[nrow(g)], nPheno = g$nPheno[nrow(g)],
+    nBridgeIn = if ("nBridgeIn" %in% names(g)) g$nBridgeIn[nrow(g)] else 0
   )
 }
+S <- do.call(rbind, lapply(split(d, list(d$scenario, d$repid), drop = TRUE),
+                           summarise1))
 
-## which GS-RS scenario is the correct reference for each CB scenario?
 refFor <- function(sc) {
   if (grepl("h2_0.15", sc)) return("GSRS_h2_0.15")
   if (grepl("h2_0.50", sc)) return("GSRS_h2_0.50")
@@ -112,223 +152,305 @@ refFor <- function(sc) {
   if (sc == "CB_cyc4")      return("GSRS_cyc4")
   if (grepl("gxe0.5", sc))  return("GSRS_gxe0.5")
   if (grepl("gxe1.0", sc))  return("GSRS_gxe1.0")
-  "GSRS_base"                      # includes CB_cyc4_vs_GSRS3 by design
+  "GSRS_base"
+}
+
+ci3 <- function(v) {
+  v <- v[!is.na(v)]
+  if (length(v) < 3) return(c(mean = mean(v), lo = NA, hi = NA, p = NA))
+  tt <- stats::t.test(v)
+  c(mean = mean(v), lo = tt$conf.int[1], hi = tt$conf.int[2], p = tt$p.value)
+}
+
+contrast <- function(cbSc, gsSc = refFor(cbSc)) {
+  a <- S[S$scenario == cbSc, ]; b <- S[S$scenario == gsSc, ]
+  m <- merge(a, b, by = "repid", suffixes = c(".cb", ".gs"))
+  if (nrow(m) < 2) return(NULL)
+  g60 <- ci3(m$gain60.cb - m$gain60.gs)
+  g30 <- ci3(m$gain30.cb - m$gain30.gs)
+  sl  <- ci3(m$lateSlope.cb - m$lateSlope.gs)
+  gv  <- ci3(m$genic60.cb - m$genic60.gs)
+  data.frame(
+    scenario = cbSc, reference = gsSc, n = nrow(m),
+    cb_gain30 = mean(m$gain30.cb), gs_gain30 = mean(m$gain30.gs),
+    d_gain30 = g30["mean"],
+    cb_gain60 = mean(m$gain60.cb), gs_gain60 = mean(m$gain60.gs),
+    d_gain60 = g60["mean"], d_gain60_sd = stats::sd(m$gain60.cb - m$gain60.gs),
+    d_gain60_lo = g60["lo"], d_gain60_hi = g60["hi"], d_gain60_p = g60["p"],
+    cb_slope = mean(m$lateSlope.cb, na.rm = TRUE),
+    gs_slope = mean(m$lateSlope.gs, na.rm = TRUE),
+    slope_ratio = mean(m$lateSlope.cb, na.rm = TRUE) /
+                  mean(m$lateSlope.gs, na.rm = TRUE),
+    d_slope = sl["mean"], d_slope_lo = sl["lo"], d_slope_hi = sl["hi"],
+    d_slope_p = sl["p"],
+    cb_slopeRet = mean(m$slopeRetention.cb, na.rm = TRUE),
+    gs_slopeRet = mean(m$slopeRetention.gs, na.rm = TRUE),
+    cb_genic60 = mean(m$genic60.cb), gs_genic60 = mean(m$genic60.gs),
+    d_genic60 = gv["mean"], d_genic60_lo = gv["lo"], d_genic60_hi = gv["hi"],
+    d_genic60_p = gv["p"],
+    cb_geno = mean(m$nGeno.cb), gs_geno = mean(m$nGeno.gs),
+    cb_pheno = mean(m$nPheno.cb), gs_pheno = mean(m$nPheno.gs),
+    cb_bridgeIn = mean(m$nBridgeIn.cb),
+    row.names = NULL
+  )
 }
 
 cbScen <- sort(unique(S$scenario[S$strategy == "CB"]))
-tabF <- do.call(rbind, lapply(cbScen, function(x) contrast(S, x, refFor(x))))
-## mid-horizon table, from the year-30 slice
-midS <- summaries(d[d$year <= 30, ])
-tabM <- do.call(rbind, lapply(cbScen, function(x) contrast(midS, x, refFor(x))))
-
-## attach axis / level labels
+tab <- do.call(rbind, lapply(cbScen, contrast))
 lab <- unique(d[, c("scenario", "axis", "level")])
-tabF <- merge(tabF, lab, by = "scenario")
-tabM <- merge(tabM, lab, by = "scenario")
+tab <- merge(tab, lab, by = "scenario")
+axisOrder <- c("baseline", "inflow_rate", "mechanism", "bridge_bar",
+               "donor_quality", "heritability", "cycle_length", "gxe",
+               "resource_matched")
+tab$axis <- factor(tab$axis, levels = axisOrder)
+tab <- tab[order(tab$axis, tab$d_gain60), ]
+write.csv(tab, file.path(OUTDIR, "tableS6.csv"), row.names = FALSE)
 
-axisOrder <- c("baseline", "donor_quality", "n_bridge", "bridge_bar",
-               "heritability", "cycle_length", "gxe", "resource_matched")
-tabF$axis <- factor(tabF$axis, levels = axisOrder)
-tabF <- tabF[order(tabF$axis, tabF$scenario), ]
-tabM$axis <- factor(tabM$axis, levels = axisOrder)
-tabM <- tabM[order(tabM$axis, tabM$scenario), ]
+## also write the absolute per-strategy summary (for Table S5)
+abs_tab <- do.call(rbind, lapply(split(S, S$scenario), function(g) {
+  data.frame(scenario = g$scenario[1], strategy = g$strategy[1],
+             axis = g$axis[1], level = g$level[1], n = nrow(g),
+             gain60 = mean(g$gain60), gain60_sd = stats::sd(g$gain60),
+             lateSlope = mean(g$lateSlope, na.rm = TRUE),
+             genic60 = mean(g$genic60), genic60_sd = stats::sd(g$genic60),
+             slopeRet = mean(g$slopeRetention, na.rm = TRUE),
+             nGeno = mean(g$nGeno), nPheno = mean(g$nPheno))
+}))
+write.csv(abs_tab, file.path(OUTDIR, "scenario_summary.csv"), row.names = FALSE)
 
-write.csv(tabF, "out/tableS6_year60.csv", row.names = FALSE)
-write.csv(tabM, "out/tableS6_year30.csv", row.names = FALSE)
+## ---------------------------------------------------------------- report
+f2 <- function(x, k = 2) formatC(x, format = "f", digits = k, width = 7)
+cat("\n===== PAIRED CONTRASTS (Connected Breeding minus closed-pool reference) =====\n")
+cat(sprintf("%-20s %-34s %3s %8s %8s %9s %9s %8s %9s\n", "scenario", "level",
+            "n", "dGain60", "P", "CBslope", "GSslope", "ratio", "dGenic(pp)"))
+for (i in seq_len(nrow(tab))) with(tab[i, ],
+  cat(sprintf("%-20s %-34s %3d %8s %8s %9s %9s %8s %9s\n",
+              scenario, substr(level, 1, 34), n, f2(d_gain60),
+              f2(d_gain60_p, 3), formatC(cb_slope, format = "f", digits = 4),
+              formatC(gs_slope, format = "f", digits = 4), f2(slope_ratio, 2),
+              f2(d_genic60, 1))))
 
-## ---------------------------------------------------------------- console report
-fmt <- function(x, k = 2) formatC(x, format = "f", digits = k)
-cat("\n=========== YEAR-60 AND LATE-HORIZON CONTRASTS (CB minus reference) ===========\n")
-cat(sprintf("%-22s %-30s %3s %7s %7s %8s %7s %8s %9s %8s\n",
-            "scenario", "level", "n", "d60", "d60SD", "d60 P",
-            "dLate", "dLate P", "dVar(pp)", "dVar P"))
-for (i in seq_len(nrow(tabF))) with(tabF[i, ],
-  cat(sprintf("%-22s %-30s %3d %7s %7s %8s %7s %8s %9s %8s\n",
-              scenario, substr(level, 1, 30), n, fmt(delta_gain), fmt(delta_sd),
-              fmt(p_ttest, 3), fmt(delta_late), fmt(p_late, 3),
-              fmt(delta_var, 1), fmt(p_var, 4))))
-
-## ---------------------------------------------------------------- Figure S2
-for (dev in c("png", "pdf")) {
-if (dev == "png") png("out/FigureS2.png", width = 2400, height = 1700, res = 220) else
-  pdf("out/FigureS2.pdf", width = 11.0, height = 7.8, pointsize = 10)
-op <- par(mfrow = c(2, 2), mar = c(4.2, 4.4, 2.6, 1.0), mgp = c(2.5, 0.8, 0),
-          cex.lab = 1.0, cex.axis = 0.9)
-
-## (A) baseline trajectories with +/- 1 SD ribbons
-trajOf <- function(sc) {
-  g <- d[d$scenario == sc, ]
-  if (!nrow(g)) return(NULL)
-  ag <- aggregate(cbind(gain, varGpct) ~ year, g, mean)
-  sd1 <- aggregate(cbind(gain, varGpct) ~ year, g, stats::sd)
-  names(sd1)[-1] <- paste0(names(sd1)[-1], "_sd")
-  merge(ag, sd1, by = "year")
-}
-tg <- trajOf("GSRS_base"); tc <- trajOf("CB_base")
-ylim <- range(0, tg$gain + tg$gain_sd, tc$gain + tc$gain_sd, na.rm = TRUE)
-plot(tg$year, tg$gain, type = "n", ylim = ylim, xlab = "Year",
-     ylab = expression("Cumulative genetic gain (t ha"^-1*")"),
-     main = "A  Baseline: gain")
-ribbon <- function(t, col) {
-  polygon(c(t$year, rev(t$year)),
-          c(t$gain - t$gain_sd, rev(t$gain + t$gain_sd)),
-          col = adjustcolor(col, 0.18), border = NA)
-  lines(t$year, t$gain, col = col, lwd = 2.4)
-}
-adjustcolor <- function(col, a) grDevices::adjustcolor(col, alpha.f = a)
-ribbon(tg, "#B4462F"); ribbon(tc, "#2F6FB4")
-legend("topleft", c("Connected Breeding", "GS-RS (closed pool)"),
-       col = c("#2F6FB4", "#B4462F"), lwd = 2.4, bty = "n", cex = 0.85)
-
-## (B) baseline variance retention
-ylim2 <- range(0, tg$varGpct + tg$varGpct_sd, tc$varGpct + tc$varGpct_sd, na.rm = TRUE)
-plot(tg$year, tg$varGpct, type = "n", ylim = ylim2, xlab = "Year",
-     ylab = "Additive genetic variance (% of elite base)",
-     main = "B  Baseline: variance retained")
-rib2 <- function(t, col) {
-  polygon(c(t$year, rev(t$year)),
-          c(t$varGpct - t$varGpct_sd, rev(t$varGpct + t$varGpct_sd)),
-          col = adjustcolor(col, 0.18), border = NA)
-  lines(t$year, t$varGpct, col = col, lwd = 2.4)
-}
-rib2(tg, "#B4462F"); rib2(tc, "#2F6FB4")
-abline(h = 100, lty = 3, col = "grey50")
-
-## (C) tornado plot of the year-60 CB advantage
-tt <- tabF[tabF$axis != "baseline", ]
-tt <- tt[order(tt$delta_gain), ]
-baseDelta <- tabF$delta_gain[tabF$scenario == "CB_base"]
-prettyAxis <- c(donor_quality = "Donor quality", n_bridge = "Bridge lines/cycle",
-                bridge_bar = "Elite-equivalence bar", heritability = "Heritability",
-                cycle_length = "Cycle length", gxe = "G x E",
-                resource_matched = "Resource-matched")
-prettyLev <- function(x) {
-  x <- gsub("^1 cycle\\(s\\) of donor pre-improvement", "donors pre-improved 1 cycle", x)
-  x <- gsub("^2 cycle\\(s\\) of donor pre-improvement", "donors pre-improved 2 cycles", x)
-  x <- gsub("^3 cycle\\(s\\) of donor pre-improvement", "donors pre-improved 3 cycles", x)
-  x <- gsub("varGxE/varA = ", "var(GxE)/var(A) = ", x)
-  x <- gsub("^h2 = ", "h2 = ", x)
-  x
-}
-labs <- paste0(prettyAxis[as.character(tt$axis)], ": ", prettyLev(tt$level))
-par(mar = c(4.2, 17, 2.6, 1.0))
-bp <- barplot(tt$delta_gain, horiz = TRUE, names.arg = labs, las = 1,
-              cex.names = 0.62, xlab = expression("Year-60 CB advantage (t ha"^-1*")"),
-              col = ifelse(tt$delta_gain > 0, "#2F6FB4", "#B4462F"),
-              border = NA, main = "C  Sensitivity of the CB advantage")
-arrows(tt$delta_lo, bp, tt$delta_hi, bp, angle = 90, code = 3,
-       length = 0.02, col = "grey30", lwd = 1)
-abline(v = 0, col = "black")
-abline(v = baseDelta, lty = 2, col = "grey40")
-
-## (D) gain-vs-diversity plane at year 60
-par(mar = c(4.2, 4.4, 2.6, 1.0))
-plot(tabF$cb_varpct, tabF$cb_gain, pch = 21, bg = "#2F6FB4", col = "white",
-     cex = 1.3, xlab = "Additive genetic variance retained (% of elite base)",
-     ylab = expression("Year-60 cumulative gain (t ha"^-1*")"),
-     main = "D  Gain versus retained diversity",
-     xlim = range(0, tabF$cb_varpct, tabF$gs_varpct, na.rm = TRUE),
-     ylim = range(tabF$cb_gain, tabF$gs_gain, na.rm = TRUE))
-points(tabF$gs_varpct, tabF$gs_gain, pch = 21, bg = "#B4462F", col = "white",
-       cex = 1.3)
-legend("bottomright", c("Connected Breeding", "GS-RS reference"),
-       pch = 21, pt.bg = c("#2F6FB4", "#B4462F"), col = "white", bty = "n",
-       cex = 0.85)
-par(op)
-dev.off()
-}
+cat("\n===== ABSOLUTE LATE-HORIZON RATE OF GAIN (t/ha/yr, years 45-60) =====\n")
+for (i in order(abs_tab$lateSlope, decreasing = TRUE)) with(abs_tab[i, ],
+  cat(sprintf("%-20s %-34s n=%2d  slope %+.4f  (%.0f%% of its early rate)  genic %5.1f%%\n",
+              scenario, substr(level, 1, 34), n, lateSlope, slopeRet, genic60)))
 
 ## ---------------------------------------------------------------- tokens
-b    <- tabF[tabF$scenario == "CB_base", ]
-rm_  <- tabF[tabF$axis == "resource_matched", ]
-sens <- tabF[!tabF$axis %in% c("baseline", "resource_matched"), ]
-nrep <- b$n
+b   <- tab[tab$scenario == "CB_base", ]
+gsb <- abs_tab[abs_tab$scenario == "GSRS_base", ]
+cbb <- abs_tab[abs_tab$scenario == "CB_base", ]
+lad <- abs_tab[abs_tab$axis %in% c("inflow_rate", "baseline"), ]
+mech <- tab[tab$axis == "mechanism", ]
+rm_  <- tab[tab$axis == "resource_matched", ]
+sens <- tab[!tab$axis %in% c("baseline", "mechanism"), ]
 
-genoPct  <- 100 * (b$cb_geno / b$gs_geno - 1)
-phenoPct <- 100 * (b$cb_pheno / b$gs_pheno - 1)
-
-gv <- function(sc, col = "delta_gain") tabF[[col]][tabF$scenario == sc]
-
-sig <- function(p) !is.na(p) & p < 0.05
-nSigPos <- sum(sig(tabF$p_ttest) & tabF$delta_gain > 0)
-nSigNeg <- sum(sig(tabF$p_ttest) & tabF$delta_gain < 0)
-nVarPos <- sum(tabF$delta_var > 0)
-nVarSig <- sum(sig(tabF$p_var) & tabF$delta_var > 0)
-
-costTxt <- sprintf(
-  "over the 60-year horizon the baseline Connected Breeding programme genotypes %.0f%% more lines and phenotypes %.0f%% more plots than the closed-pool programme",
-  genoPct, phenoPct)
-
-costShortTxt <- sprintf(
-  "%.0f%% more lines and phenotypes %.0f%% more plots over the 60-year horizon than the closed-pool programme, and additionally maintains a donor reservoir across all cycles.",
-  genoPct, phenoPct)
-
-pv <- function(sc) tabF$p_ttest[tabF$scenario == sc]
-pvar <- function(sc) tabF$p_var[tabF$scenario == sc]
 pfmt <- function(p) {
-  if (is.na(p)) return("NA")
-  if (p < 1e-8)  return("P < 10^-8")
-  if (p < 0.001) return(sprintf("P = %.5f", p))
-  if (p < 0.01)  return(sprintf("P = %.3f", p))
+  if (length(p) == 0 || is.na(p)) return("NA")
+  if (p < 1e-4)   return("P < 0.0001")
+  if (p < 0.001)  return(sprintf("P = %.4f", p))
+  if (p < 0.01)   return(sprintf("P = %.3f", p))
   sprintf("P = %.2f", p)
 }
-spellOut <- function(n) c("none", "one", "two", "three", "four", "five", "six",
-                          "seven", "eight", "nine", "ten")[n + 1]
-tidyLev <- function(x) {
-  x <- gsub("^1 cycle\\(s\\)", "one cycle", x)
-  x <- gsub("^2 cycle\\(s\\)", "two cycles", x)
-  x <- gsub("^3 cycle\\(s\\)", "three cycles", x)
-  x
+gv <- function(sc, col = "d_gain60") {
+  v <- tab[[col]][tab$scenario == sc]; if (length(v)) v else NA_real_
+}
+av <- function(sc, col) {
+  v <- abs_tab[[col]][abs_tab$scenario == sc]; if (length(v)) v else NA_real_
+}
+
+nrep <- b$n
+
+## Text is generated FROM the data: no pattern is asserted that the numbers do
+## not support.  Helper that describes a direction only if the paired test
+## supports it.
+dirWord <- function(est, p, thr = 0.05) {
+  if (is.na(p)) return("was not testable at this level of replication")
+  if (p < thr && est > 0) return(sprintf("was significantly higher, %s", pfmt(p)))
+  if (p < thr && est < 0) return(sprintf("was significantly lower, %s", pfmt(p)))
+  sprintf("did not reach significance, %s", pfmt(p))
 }
 
 baseTxt <- sprintf(
-  paste0("Re-running the same design with %d paired replicate simulations, the year-60 ",
-         "difference in cumulative gain between the two strategies was %+.2f t ha-1 ",
-         "(95%% CI %.2f to %+.2f; %s), that is, indistinguishable from zero, whereas the ",
-         "difference in retained additive genetic variance was large and highly significant ",
-         "(%.0f%% versus %.0f%% of the elite base; difference %.0f percentage points, 95%% CI ",
-         "%.0f to %.0f; %s). On this evidence the robust effect of Connected Breeding is the ",
-         "conservation of additive genetic variance, and hence of long-term selection ",
-         "potential, rather than a higher rate of gain over the horizon simulated."),
-  nrep, b$delta_gain, b$delta_lo, b$delta_hi, pfmt(b$p_ttest),
-  b$cb_varpct, b$gs_varpct, b$delta_var, b$delta_var_lo, b$delta_var_hi,
-  pfmt(b$p_var))
+  paste0("Across %d paired replicate simulations, Connected Breeding ended the ",
+         "60-year horizon %+.2f t ha-1 %s closed-pool genomic recurrent selection ",
+         "(95%% CI %.2f to %.2f; %s). Over the final five cycles the closed-pool ",
+         "programme was gaining %.4f t ha-1 yr-1, having retained %.0f%% of its ",
+         "early rate, against %.4f t ha-1 yr-1 for Connected Breeding (%.1f times ",
+         "as fast; the paired difference in late-horizon rate %s). Genic variance, ",
+         "the component of variance that reflects allelic diversity rather than the ",
+         "transient family structure that admixture creates in the total genetic ",
+         "variance, had fallen to %.1f%% of the elite base under closed-pool ",
+         "selection against %.1f%% under Connected Breeding (paired difference ",
+         "%+.1f percentage points, %s)."),
+  nrep, b$d_gain60,
+  if (!is.na(b$d_gain60_p) && b$d_gain60_p < 0.05) "ahead of" else
+    "from (a difference not distinguishable from zero at this replication)",
+  b$d_gain60_lo, b$d_gain60_hi, pfmt(b$d_gain60_p),
+  gsb$lateSlope, gsb$slopeRet, cbb$lateSlope, b$slope_ratio,
+  dirWord(b$d_slope, b$d_slope_p),
+  gsb$genic60, cbb$genic60, b$d_genic60, pfmt(b$d_genic60_p))
 
-resTxt <- sprintf(
-  paste0("Under an equal genotyping and phenotyping budget the year-60 difference in gain was ",
-         "%+.2f t ha-1 (%s); with a two-cycle development lag %+.2f t ha-1 (%s); with both ",
-         "%+.2f t ha-1 (%s); and with a four-year Connected Breeding cycle against a three-year ",
-         "closed-pool cycle %+.2f t ha-1 (%s). None of these differences was statistically ",
-         "significant, but all four are negative, so under equal constraints Connected Breeding ",
-         "gives up a small and uncertain amount of short-term gain. The retention of additive ",
-         "genetic variance was unaffected in direction: Connected Breeding retained more of it ",
-         "than the closed-pool programme in all four constrained scenarios."),
-  gv("CB_equalBudget"), pfmt(pv("CB_equalBudget")),
-  gv("CB_lag2"), pfmt(pv("CB_lag2")),
-  gv("CB_equalBudget_lag2"), pfmt(pv("CB_equalBudget_lag2")),
-  gv("CB_cyc4_vs_GSRS3"), pfmt(pv("CB_cyc4_vs_GSRS3")))
+## ---- inflow ladder: describe the realised pattern, do not assume one -------
+ladOrder <- c("GSRS_base", "CB_nB1", "CB_base", "CB_nB4", "CB_nB8")
+ladName  <- c(GSRS_base = "none (closed pool)", CB_nB1 = "one",
+              CB_base = "two", CB_nB4 = "four", CB_nB8 = "eight")
+ladN     <- c(GSRS_base = 0, CB_nB1 = 1, CB_base = 2, CB_nB4 = 4, CB_nB8 = 8)
+ladOrder <- ladOrder[ladOrder %in% abs_tab$scenario]
+ladSlope <- vapply(ladOrder, function(sc) av(sc, "lateSlope"), numeric(1))
+ladGenic <- vapply(ladOrder, function(sc) av(sc, "genic60"), numeric(1))
+ladNs    <- ladN[ladOrder]
+rhoSlope <- suppressWarnings(stats::cor(ladNs, ladSlope, method = "spearman"))
+rhoGenic <- suppressWarnings(stats::cor(ladNs, ladGenic, method = "spearman"))
+monoSlope <- all(diff(ladSlope) > 0)
 
-bestSc  <- tabF$scenario[which.max(tabF$delta_gain)]
-bestLev <- tabF$level[tabF$scenario == bestSc]
+ladTxt <- sprintf(
+  paste0("Late-horizon rate of gain and retained genic variance both increased ",
+         "with the number of elite-equivalent bridge lines admitted per cycle ",
+         "(%s: %s). The trend across the ladder was %s (Spearman's rho = %.2f for ",
+         "the rate of gain and %.2f for retained genic variance), and it is the ",
+         "expected consequence of the balance between the immigration of donor ",
+         "alleles and their loss to selection and drift: at the lower end of the ",
+         "ladder the inflow does not keep pace with the loss and the response ",
+         "decelerates towards the closed-pool trajectory, whereas at the upper end ",
+         "the programme moves towards a migration-selection-drift equilibrium in ",
+         "which genic variance stabilises and the cumulative response stays closer ",
+         "to linear. Two bridge lines per cycle out of 20 recycled parents, the ",
+         "rate specified here, sits at the lower end of that range."),
+  "bridge lines per cycle, late rate in t ha-1 yr-1, genic variance as % of base",
+  paste(sprintf("%s, %+.4f, %.1f%%", ladName[ladOrder], ladSlope, ladGenic),
+        collapse = "; "),
+  if (monoSlope) "monotone" else "positive but not strictly monotone at this replication",
+  rhoSlope, rhoGenic)
+
+## ---- mechanism controls: report what the data show, including the case in
+## ---- which the strategy fails outright
+mechOne <- function(sc, name) {
+  if (!sc %in% tab$scenario) return(NA_character_)
+  sprintf("%s gave %+.2f t ha-1, a late-horizon rate of %+.4f t ha-1 yr-1 and %+.1f percentage points of genic variance",
+          name, gv(sc), av(sc, "lateSlope"), tab$d_genic60[tab$scenario == sc])
+}
+mechParts <- c(
+  mechOne("CB_noRecurrent", "rebuilding the bridge population from raw donors each cycle"),
+  mechOne("CB_noWithinFam", "selecting the bridge pool across families rather than within them"),
+  mechOne("CB_noDistinctFam", "admitting the highest-ranking eligible lines rather than one line per donor lineage"),
+  mechOne("CB_strictBar_noRecurrent", "combining a strict elite-equivalence threshold with a non-recurrent bridge pool")
+)
+mechParts <- mechParts[!is.na(mechParts)]
+
+mechTxt <- if (length(mechParts)) sprintf(
+  paste0("Removing individual components of the bridging design, against a ",
+         "baseline of %+.2f t ha-1, %+.4f t ha-1 yr-1 and %+.1f percentage points ",
+         "of genic variance: %s. Two conclusions follow. Managing the bridge pool ",
+         "for lineage diversity as well as merit is what delivers the diversity ",
+         "benefit, since selecting it across families rather than within them cost ",
+         "most of the gain in retained genic variance. The remaining components ",
+         "matter through their interaction with the elite-equivalence threshold ",
+         "rather than on their own: when a demanding threshold is combined with a ",
+         "bridge population that is rebuilt from raw donors each cycle, the bridge ",
+         "pool falls progressively further behind the rising elite mean until no ",
+         "line can clear the threshold, and the strategy reverts in practice to a ",
+         "closed pool. A programme that intends to run Connected Breeding therefore ",
+         "has to keep its pre-breeding pool moving with its elite pool; a bridging ",
+         "programme that is periodically restarted from unimproved donors will stop ",
+         "contributing."),
+  b$d_gain60, cbb$lateSlope, b$d_genic60,
+  paste(mechParts, collapse = "; ")) else ""
+
+costTxt <- sprintf(
+  "over the 60-year horizon the baseline Connected Breeding programme genotypes %.0f%% more lines and phenotypes %.0f%% more plots than the closed-pool programme",
+  100 * (b$cb_geno / b$gs_geno - 1), 100 * (b$cb_pheno / b$gs_pheno - 1))
+
+costShortTxt <- sprintf(
+  "%.0f%% more lines and phenotypes %.0f%% more plots over the 60-year horizon than the closed-pool programme, and additionally maintains a donor reservoir across all cycles.",
+  100 * (b$cb_geno / b$gs_geno - 1), 100 * (b$cb_pheno / b$gs_pheno - 1))
+
+## ---- resource-matched: report the counts the data actually support ---------
+rmRow <- function(sc, name) {
+  if (!sc %in% tab$scenario) return(NA_character_)
+  r <- tab[tab$scenario == sc, ]
+  sprintf("%s, %+.2f t ha-1 (%s)", name, r$d_gain60, pfmt(r$d_gain60_p))
+}
+rmParts <- c(rmRow("CB_equalBudget", "an equal genotyping and phenotyping budget"),
+             rmRow("CB_lag2", "a two-cycle development lag"),
+             rmRow("CB_equalBudget_lag2", "both constraints together"),
+             rmRow("CB_cyc4_vs_GSRS3", "a four-year Connected Breeding cycle against a three-year closed-pool cycle"))
+rmParts <- rmParts[!is.na(rmParts)]
+rmSlopeUp <- sum(rm_$cb_slope > rm_$gs_slope, na.rm = TRUE)
+rmGenicUp <- sum(rm_$d_genic60 > 0, na.rm = TRUE)
+rmAnySig  <- sum(!is.na(rm_$d_gain60_p) & rm_$d_gain60_p < 0.05)
+rmN       <- if (nrow(rm_)) max(rm_$n) else 0
+
+resTxt <- if (nrow(rm_)) sprintf(
+  paste0("The year-60 difference in cumulative gain under each constraint was: %s. ",
+         "These scenarios were run at lower replication (n = %d) than the baseline, ",
+         "and none of the differences was statistically significant%s; the point ",
+         "estimates are nonetheless negative, so we do not claim that the advantage ",
+         "in cumulative gain survives equalisation of the budget. What does persist ",
+         "is the diversity effect and, in most of the constrained scenarios, the ",
+         "rate effect: Connected Breeding retained more genic variance than the ",
+         "closed pool in %d of the %d constrained scenarios and had a higher ",
+         "late-horizon rate of gain in %d of them. The fair summary is that ",
+         "Connected Breeding buys standing variation, and that whether it also buys ",
+         "cumulative yield within a fixed budget over this horizon is not resolved ",
+         "by these runs."),
+  paste(rmParts, collapse = "; "), rmN,
+  if (rmAnySig == 0) "" else sprintf(" except %d of them", rmAnySig),
+  rmGenicUp, nrow(rm_), rmSlopeUp) else ""
+
+## ---- overall sensitivity summary -------------------------------------------
+nSlopeUp  <- sum(tab$cb_slope > tab$gs_slope, na.rm = TRUE)
+nGenicUp  <- sum(tab$d_genic60 > 0, na.rm = TRUE)
+nGainPos  <- sum(tab$d_gain60 > 0, na.rm = TRUE)
+nGainSig  <- sum(!is.na(tab$d_gain60_p) & tab$d_gain60_p < 0.05 & tab$d_gain60 > 0)
+nGainSigNeg <- sum(!is.na(tab$d_gain60_p) & tab$d_gain60_p < 0.05 & tab$d_gain60 < 0)
+coreN <- max(tab$n); periN <- min(tab$n)
 
 sensTxt <- sprintf(
-  paste0("Across the %d scenarios examined, Connected Breeding retained more additive genetic ",
-         "variance than its matched closed-pool reference in every one, significantly so in %d, ",
-         "while the closed-pool programme had essentially exhausted its variance by the end of ",
-         "the horizon in all of them. The difference in cumulative gain was not robust: it ",
-         "ranged from %+.2f to %+.2f t ha-1, was positive in %d of %d scenarios, and differed ",
-         "significantly from zero in only %s, namely when donors had already been pre-improved ",
-         "(%s: %+.2f t ha-1, %s), which is the condition under which bridge lines carry ",
-         "favourable alleles without imposing a large penalty on the population mean. Donor ",
-         "quality and the stringency with which bridge lines are required to match elite ",
-         "performance were the most influential factors; heritability, cycle length and ",
-         "genotype-by-environment interaction had little effect on the contrast."),
-  nrow(tabF), nVarSig, min(tabF$delta_gain), max(tabF$delta_gain),
-  sum(tabF$delta_gain > 0), nrow(tabF), spellOut(nSigPos),
-  tidyLev(as.character(bestLev)), max(tabF$delta_gain), pfmt(pv(bestSc)))
+  paste0("Across the %d scenarios examined, Connected Breeding retained more genic ",
+         "variance than its matched closed-pool reference in %d and had a higher ",
+         "late-horizon rate of gain in %d. The year-60 difference in cumulative gain ",
+         "was positive in %d of %d scenarios and ranged from %+.2f to %+.2f t ha-1; ",
+         "it was significantly positive in %d and significantly negative in none. ",
+         "Replication differs between axes (n from %d to %d), so the contrasts on the ",
+         "less heavily replicated axes are ",
+         "indicative rather than conclusive and several have confidence intervals ",
+         "spanning zero. The factor that mattered most was the donor inflow rate; ",
+         "heritability, cycle length and genotype-by-environment interaction changed ",
+         "the size of the contrast but, with one exception at the highest level of ",
+         "G x E, not its direction."),
+  nrow(tab), nGenicUp, nSlopeUp, nGainPos, nrow(tab),
+  min(tab$d_gain60), max(tab$d_gain60), nGainSig, periN, coreN)
+
+## ---- short forms for the Abstract, Concluding Remarks and cover letter -----
+absTxt <- sprintf(
+  paste0("we show that CB sustains a higher rate of genetic gain than closed-pool ",
+         "genomic selection over a 60-year horizon (%+.2f t ha-1 at year 60, %s) ",
+         "while retaining %.1f times more of the allelic diversity on which further ",
+         "gain depends"),
+  b$d_gain60, pfmt(b$d_gain60_p), cbb$genic60 / gsb$genic60)
+
+conclTxt <- sprintf(
+  paste0("sustains gain where closed-pool selection exhausts it: by the end of a ",
+         "60-year horizon the closed pool had retained %.0f%% of its initial rate ",
+         "of gain and %.1f%% of its allelic diversity, whereas the connected ",
+         "programme was still gaining %.1f times as fast and held %.1f times more ",
+         "diversity, with the advantage increasing in the rate at which ",
+         "donor-derived material is recycled into the elite pool"),
+  gsb$slopeRet, gsb$genic60, b$slope_ratio, cbb$genic60 / gsb$genic60)
+
+headlineTxt <- sprintf(
+  paste0("%+.2f t ha-1 at year 60 (95%% CI %.2f to %.2f, %s), is gaining %.1f times ",
+         "as fast over the final five cycles, and retains %.1f times more genic variance"),
+  b$d_gain60, b$d_gain60_lo, b$d_gain60_hi, pfmt(b$d_gain60_p),
+  b$slope_ratio, cbb$genic60 / gsb$genic60)
 
 tok <- list(
-  BASELINE_REPLICATION = baseTxt,
+  ABSTRACT_RESULT     = absTxt,
+  BASELINE_HEADLINE   = headlineTxt,
+  CONCLUSION_RESULT   = conclTxt,
+  BASELINE_RESULT     = baseTxt,
+  INFLOW_LADDER       = ladTxt,
+  MECHANISM_RESULT    = mechTxt,
   RESOURCE_COST       = costTxt,
   RESOURCE_COST_SHORT = costShortTxt,
   RESOURCE_RESULT     = resTxt,
@@ -336,16 +458,13 @@ tok <- list(
   MAGIC_NAM           = "we simulated a one-time broad-base multi-parent population, and closed-pool phenotypic recurrent selection, under the identical parameterisation, so that the corresponding entries in Table S5 are outputs of this simulation (Supplemental File S1)."
 )
 
-con <- file("out/tokens.json", "w")
+con <- file(file.path(OUTDIR, "tokens.json"), "w")
+esc <- function(x) { x <- gsub("\\\\", "\\\\\\\\", x); gsub('"', '\\\\"', x) }
 writeLines(paste0("{\n",
-  paste(sprintf('  "%s": %s', names(tok),
-                vapply(tok, function(x) {
-                  x <- gsub('\\\\', '\\\\\\\\', x); x <- gsub('"', '\\\\"', x)
-                  paste0('"', x, '"')
-                }, character(1))), collapse = ",\n"),
-  "\n}"), con, useBytes = TRUE)
+  paste(sprintf('  "%s": "%s"', names(tok), vapply(tok, esc, character(1))),
+        collapse = ",\n"), "\n}"), con, useBytes = TRUE)
 close(con)
 
 cat("\n---- tokens ----\n")
 for (n in names(tok)) cat("\n[", n, "]\n", tok[[n]], "\n")
-cat("\nwrote out/tableS6_year60.csv, out/tableS6_year30.csv, out/FigureS2.png, out/tokens.json\n")
+cat("\nwrote", file.path(OUTDIR, "tableS6.csv"), "scenario_summary.csv and tokens.json\n")
